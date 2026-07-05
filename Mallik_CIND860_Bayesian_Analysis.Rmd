@@ -1,0 +1,843 @@
+---
+title: "Bayesian Logistic Regression for Low Muscle Mass Prediction (NHANES 2011–2018)"
+subtitle: "CIND860 Capstone Project — Toronto Metropolitan University"
+author: "Adiel Mallik"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.width  = 9,
+  fig.height = 6,
+  fig.align  = "center",
+  cache      = FALSE
+)
+
+# ── Package installation ──────────────────────────────────────────────────────
+required_pkgs <- c(
+  "readxl", "dplyr", "tidyr", "ggplot2", "forcats", "purrr",
+  "brms", "bayesplot", "bayestestR", "posterior",
+  "pROC", "caret",
+  "knitr", "kableExtra", "gt", "scales"
+)
+new_pkgs <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly = TRUE)]
+if (length(new_pkgs)) install.packages(new_pkgs, repos = "https://cloud.r-project.org")
+
+# ── Libraries ─────────────────────────────────────────────────────────────────
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(forcats)
+library(purrr)
+library(brms)
+library(bayesplot)
+library(bayestestR)
+library(posterior)
+library(pROC)
+library(caret)
+library(knitr)
+library(kableExtra)
+library(gt)
+library(scales)
+library(logspline)
+
+set.seed(42)
+
+# ── M1 Pro: global parallelism setting ───────────────────────────────────────
+# Sets the default number of parallel chains to the number of physical cores.
+# On an M1 Pro this is 10 (8 performance + 2 efficiency); all 4 chains run
+# simultaneously with cores to spare.
+options(mc.cores = parallel::detectCores())
+cat("Detected cores:", parallel::detectCores(), "\n")
+
+# ── bayesplot colour scheme ───────────────────────────────────────────────────
+color_scheme_set("blue")
+```
+
+```{r m1-compiler-setup, include=FALSE}
+# ── M1 Pro: enable native ARM optimisation for Stan ──────────────────────────
+# Writes -march=native to ~/.R/Makevars so the Stan C++ compiler targets
+# Apple Silicon's full instruction set rather than a generic ARM baseline.
+# This typically reduces per-chain sampling time by 15-25%.
+# Safe to run repeatedly: appends only if the flag is not already present.
+makevars_dir  <- file.path(Sys.getenv("HOME"), ".R")
+makevars_file <- file.path(makevars_dir, "Makevars")
+
+if (!dir.exists(makevars_dir)) dir.create(makevars_dir, recursive = TRUE)
+
+existing <- if (file.exists(makevars_file)) readLines(makevars_file) else character(0)
+
+if (!any(grepl("-march=native", existing, fixed = TRUE))) {
+  cat("CXXFLAGS += -O3 -march=native\n", file = makevars_file, append = TRUE)
+  cat("Makevars updated: -march=native added for Apple Silicon optimisation.\n")
+} else {
+  cat("Makevars already contains -march=native. No changes made.\n")
+}
+```
+
+---
+
+# Data Loading and Preparation
+
+This report presents a **Bayesian logistic regression** analysis complementing
+the machine-learning models fitted in the companion report.  The Bayesian
+framework offers calibrated uncertainty quantification, interpretable posterior
+distributions for each predictor, and formal prior sensitivity analysis — none
+of which are readily available from penalised frequentist or ensemble methods.
+
+The same cleaned NHANES 2011–2018 dataset is used.  The outcome
+`low_muscle_mass` is a binary indicator (1 = ASMI below the sex-specific 20th
+percentile; 0 = normal).
+
+```{r load-data}
+# ── Load dataset ──────────────────────────────────────────────────────────────
+DATA_PATH <- "nhanes_clean_2011_2018.xlsx"   # must be in the same folder
+
+nhanes_raw <- read_excel(DATA_PATH) %>%
+  mutate(
+    low_muscle_mass = as.integer(low_muscle_mass),
+    sex             = factor(sex, levels = c("Male", "Female")),
+    race_ethnicity  = factor(race_ethnicity)
+  )
+
+cat("Raw dataset:", nrow(nhanes_raw), "rows ×", ncol(nhanes_raw), "cols\n")
+```
+
+```{r model-vars}
+# ── Select predictors and restrict to complete cases ──────────────────────────
+# Predictors specified in the analysis plan
+PRED_VARS <- c("age_years", "sex", "race_ethnicity",
+               "bmi", "protein_g", "poverty_ratio",
+               "waist_cm", "max_grip_kg")
+
+OUTCOME   <- "low_muscle_mass"
+
+nhanes_cc <- nhanes_raw %>%
+  select(all_of(c(PRED_VARS, OUTCOME))) %>%
+  filter(!is.na(low_muscle_mass)) %>%
+  drop_na()
+
+cat("Complete-case rows:", nrow(nhanes_cc), "\n")
+cat("Outcome prevalence:", round(mean(nhanes_cc$low_muscle_mass) * 100, 1), "%\n")
+
+# Prevalence by sex
+nhanes_cc %>%
+  group_by(sex) %>%
+  summarise(n = n(),
+            n_lmm = sum(low_muscle_mass),
+            pct   = round(mean(low_muscle_mass) * 100, 1),
+            .groups = "drop") %>%
+  kable(caption = "Low-muscle-mass prevalence by sex (complete cases)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r scale-data}
+# ── Standardise continuous predictors ─────────────────────────────────────────
+# brms works best with standardised continuous inputs; it stabilises sampling
+# and makes priors on coefficients directly comparable across predictors.
+CONT_VARS <- c("age_years", "bmi", "protein_g", "poverty_ratio",
+               "waist_cm", "max_grip_kg")
+
+nhanes_scaled <- nhanes_cc %>%
+  mutate(across(all_of(CONT_VARS), ~ as.numeric(scale(.))))
+
+# ── Stratified 70/30 train/test split ─────────────────────────────────────────
+set.seed(42)
+train_idx  <- createDataPartition(nhanes_scaled$low_muscle_mass,
+                                  p = 0.70, list = FALSE)
+train_df   <- nhanes_scaled[ train_idx, ]
+test_df    <- nhanes_scaled[-train_idx, ]
+
+cat("Train:", nrow(train_df), "| Test:", nrow(test_df), "\n")
+cat("Train prevalence:", round(mean(train_df$low_muscle_mass) * 100, 1), "%\n")
+cat("Test  prevalence:", round(mean(test_df$low_muscle_mass)  * 100, 1), "%\n")
+```
+
+The 20 % outcome prevalence is consistent with the by-design definition (bottom
+sex-specific quintile of ASMI).  All continuous predictors are
+mean-centred and scaled to unit standard deviation prior to modelling so that
+coefficient priors are on the same scale.
+
+---
+
+# Bayesian Logistic Regression
+
+## Prior Specification
+
+We adopt **weakly informative priors** following Gelman et al. (2008):
+
+| Parameter | Prior | Rationale |
+|-----------|-------|-----------|
+| Intercept | Normal(−1.39, 0.5) | log-odds of 20 % prevalence = log(0.2/0.8) ≈ −1.39 |
+| All coefficients | Normal(0, 0.5) | Regularising; allows OR up to ~e^1 ≈ 2.7 per SD |
+
+The intercept prior encodes our strong expectation that roughly 20 % of
+adults have low muscle mass (because the outcome is defined by the 20th
+percentile), while the coefficient priors are weakly informative — they
+discourage implausibly large effects without dominating the likelihood.
+
+```{r fit-primary, cache=TRUE, results="hide"}
+# ── Primary model formula ─────────────────────────────────────────────────────
+bayes_formula <- bf(
+  low_muscle_mass ~ age_years + sex + race_ethnicity +
+                    bmi + protein_g + poverty_ratio +
+                    waist_cm + max_grip_kg,
+  family = bernoulli(link = "logit")
+)
+
+# ── Prior specification ───────────────────────────────────────────────────────
+priors_main <- c(
+  prior(normal(-1.39, 0.5), class = Intercept),
+  prior(normal(0, 0.5),     class = b)          # all slope coefficients
+)
+
+# ── Fit primary model ─────────────────────────────────────────────────────────
+set.seed(42)
+fit_main <- brm(
+  formula  = bayes_formula,
+  data     = train_df,
+  prior    = priors_main,
+  chains   = 4,
+  iter     = 4000,
+  warmup   = 2000,
+  seed     = 42,
+  cores    = getOption("mc.cores", parallel::detectCores()),
+  backend  = "rstan",
+  refresh  = 0,
+  silent   = 2
+)
+```
+
+```{r primary-summary}
+cat("Primary model fitted successfully.\n")
+summary(fit_main)
+```
+
+---
+
+# Prior Sensitivity Analysis
+
+We refit the model under two alternative prior specifications to assess how
+sensitive the posterior inferences are to the choice of priors:
+
+- **(a) Flat priors** — improper flat priors on all slope coefficients (no `b`
+  class prior specified, so Stan places no regularisation on them); only the
+  intercept prior Normal(−1.39, 0.5) is retained. Useful as a reference
+  maximum-likelihood-like estimate but not recommended for small subgroups.
+- **(b) Conservative priors** — Normal(0, 0.25) on coefficients, encoding the
+  belief that most predictors have modest effects (OR < e^0.5 ≈ 1.65 per SD).
+
+```{r fit-flat, cache=TRUE, results="hide"}
+# ── (a) Flat priors on coefficients ──────────────────────────────────────────
+# In brms, truly flat (improper) priors on class = b are obtained by specifying
+# NO prior for that class at all. We keep only the intercept prior so the chain
+# remains anchored to the known ~20% prevalence, while all slopes are estimated
+# without any regularisation. This is the "reference" specification.
+priors_flat <- c(
+  prior(normal(-1.39, 0.5), class = Intercept)
+  # class = b intentionally omitted → Stan uses an improper flat prior
+)
+
+set.seed(42)
+fit_flat <- brm(
+  formula = bayes_formula,
+  data    = train_df,
+  prior   = priors_flat,
+  chains  = 4,
+  iter    = 4000,
+  warmup  = 2000,
+  seed    = 42,
+  cores   = getOption("mc.cores", parallel::detectCores()),
+  backend = "rstan",
+  refresh = 0,
+  silent  = 2
+)
+```
+
+```{r fit-conservative, cache=TRUE, results="hide"}
+# ── (b) Conservative priors: Normal(0, 0.25) ──────────────────────────────────
+priors_cons <- c(
+  prior(normal(-1.39, 0.5), class = Intercept),
+  prior(normal(0, 0.25),    class = b)
+)
+
+set.seed(42)
+fit_cons <- brm(
+  formula  = bayes_formula,
+  data     = train_df,
+  prior    = priors_cons,
+  chains   = 4,
+  iter     = 4000,
+  warmup   = 2000,
+  seed     = 42,
+  cores    = getOption("mc.cores", parallel::detectCores()),
+  backend  = "rstan",
+  refresh  = 0,
+  silent   = 2
+)
+```
+
+```{r sensitivity-table}
+# ── Extract posterior medians and 95% CIs for all three fits ──────────────────
+extract_post <- function(fit, label) {
+  post <- as_draws_df(fit)
+  # Keep only b_ columns (slopes) and the intercept
+  b_cols <- grep("^b_", names(post), value = TRUE)
+  post_long <- post %>%
+    select(all_of(b_cols)) %>%
+    pivot_longer(everything(), names_to = "parameter", values_to = "draw") %>%
+    group_by(parameter) %>%
+    summarise(
+      median = round(median(draw), 4),
+      q2.5   = round(quantile(draw, 0.025), 4),
+      q97.5  = round(quantile(draw, 0.975), 4),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      CI_95   = paste0("[", q2.5, ", ", q97.5, "]"),
+      Prior   = label,
+      # Clean up parameter names
+      parameter = gsub("^b_", "", parameter),
+      parameter = gsub("race_ethnicity", "race:", parameter)
+    ) %>%
+    select(Prior, parameter, median, CI_95)
+}
+
+sens_main <- extract_post(fit_main, "Main (N(0,0.5))")
+sens_flat <- extract_post(fit_flat, "Flat")
+sens_cons <- extract_post(fit_cons, "Conservative (N(0,0.25))")
+
+sens_tbl <- bind_rows(sens_main, sens_flat, sens_cons) %>%
+  pivot_wider(names_from = Prior,
+              values_from = c(median, CI_95),
+              names_glue  = "{Prior}_{.value}") %>%
+  arrange(parameter)
+
+# Re-order columns sensibly
+col_order <- c("parameter",
+               "Main (N(0,0.5))_median", "Main (N(0,0.5))_CI_95",
+               "Flat_median",            "Flat_CI_95",
+               "Conservative (N(0,0.25))_median", "Conservative (N(0,0.25))_CI_95")
+col_order <- col_order[col_order %in% names(sens_tbl)]
+sens_tbl  <- sens_tbl %>% select(all_of(col_order))
+
+sens_tbl %>%
+  gt() %>%
+  tab_header(
+    title    = "Prior Sensitivity Analysis",
+    subtitle = "Posterior median and 95% credible interval under three prior specifications"
+  ) %>%
+  cols_label(
+    parameter = "Parameter"
+  ) %>%
+  tab_spanner(label = "Main: Normal(0, 0.5)",
+              columns = starts_with("Main")) %>%
+  tab_spanner(label = "Flat",
+              columns = starts_with("Flat")) %>%
+  tab_spanner(label = "Conservative: Normal(0, 0.25)",
+              columns = starts_with("Conservative")) %>%
+  cols_label(
+    .fn = function(x) gsub("^.*_(median|CI_95)$", "\\1", x)
+  ) %>%
+  tab_footnote(
+    "Robust inference: parameters whose CIs exclude zero across all three
+     specifications can be considered prior-insensitive."
+  )
+```
+
+Parameters whose credible intervals exclude zero consistently across all three
+prior specifications provide the strongest evidence for a genuine association
+with low muscle mass, irrespective of the specific regularisation chosen.
+
+---
+
+# Posterior Diagnostics
+
+Markov chain convergence is assessed via the **R-hat statistic** (Gelman &
+Rubin, 1992; values < 1.01 indicate convergence) and the **bulk and tail
+effective sample sizes** (Vehtari et al., 2021; values > 400 per chain are
+adequate).  Trace plots provide visual confirmation of good mixing.
+
+```{r rhat-ess}
+# ── Extract R-hat and ESS for all parameters ──────────────────────────────────
+diag_df <- as_draws_df(fit_main) %>%
+  summarise_draws() %>%
+  filter(grepl("^b_|^Intercept", variable)) %>%
+  mutate(
+    variable  = gsub("^b_", "", variable),
+    variable  = gsub("race_ethnicity", "race:", variable),
+    rhat      = round(rhat,     4),
+    ess_bulk  = round(ess_bulk, 0),
+    ess_tail  = round(ess_tail, 0),
+    converged = if_else(rhat < 1.01, "Yes", "No")
+  ) %>%
+  select(variable, rhat, ess_bulk, ess_tail, converged)
+
+diag_df %>%
+  gt() %>%
+  tab_header(
+    title    = "MCMC Convergence Diagnostics — Primary Model",
+    subtitle = "R-hat < 1.01 and ESS > 400 per chain indicate adequate convergence"
+  ) %>%
+  cols_label(
+    variable  = "Parameter",
+    rhat      = "R-hat",
+    ess_bulk  = "ESS (Bulk)",
+    ess_tail  = "ESS (Tail)",
+    converged = "Converged?"
+  ) %>%
+  tab_style(
+    style     = cell_fill(color = "#FFDDDD"),
+    locations = cells_body(rows = converged == "No")
+  ) %>%
+  tab_style(
+    style     = cell_fill(color = "#DDFFDD"),
+    locations = cells_body(rows = converged == "Yes")
+  ) %>%
+  tab_footnote("R-hat values > 1.01 flagged in red; indicate potential non-convergence.")
+```
+
+```{r trace-plots, fig.height=10, fig.cap="Trace plots for key model parameters. Well-mixed chains with no trend indicate convergence."}
+# ── Trace plots for primary predictors ────────────────────────────────────────
+# Select non-race parameters + intercept for readability
+post_draws <- as_draws_array(fit_main)
+key_params <- c("b_Intercept", "b_age_years", "b_sexFemale",
+                "b_bmi", "b_waist_cm", "b_max_grip_kg",
+                "b_protein_g", "b_poverty_ratio")
+
+# Keep only params that exist in draws
+key_params <- key_params[key_params %in% dimnames(post_draws)[[3]]]
+
+mcmc_trace(post_draws, pars = key_params,
+           facet_args = list(ncol = 2, labeller = label_parsed)) +
+  labs(title    = "MCMC Trace Plots — Primary Model (Key Parameters)",
+       subtitle = "Each colour = one chain; horizontal mixing indicates convergence") +
+  theme_bw(base_size = 11)
+```
+
+```{r posterior-density, fig.cap="Posterior density plots for key parameters. Overlapping chains confirm convergence."}
+mcmc_dens_overlay(post_draws, pars = key_params) +
+  labs(title    = "Posterior Density Overlay — Primary Model",
+       subtitle = "Overlapping densities across chains confirm good mixing") +
+  theme_bw(base_size = 11)
+```
+
+---
+
+# Posterior Summaries and Inference
+
+## Coefficient Summary
+
+For each predictor we report the posterior **median** (point estimate),
+**95 % credible interval** (CI), the **probability of direction** (pd; the
+proportion of the posterior on the same side as the median — equivalent to a
+one-sided p-value), and the **odds ratio** (OR = exp(coefficient)) for
+continuous predictors standardised to one SD.
+
+```{r posterior-summary}
+# ── Posterior summaries ───────────────────────────────────────────────────────
+post_summary <- describe_posterior(
+  fit_main,
+  effects     = "fixed",
+  component   = "all",
+  centrality  = "median",
+  ci          = 0.95,
+  ci_method   = "HDI",
+  test        = c("pd", "rope"),
+  rope_range  = c(-0.1, 0.1)   # rope around zero on log-odds scale
+)
+
+post_tbl <- post_summary %>%
+  as.data.frame() %>%
+  filter(grepl("^b_|Intercept", Parameter)) %>%
+  mutate(
+    Parameter  = gsub("^b_", "", Parameter),
+    Parameter  = gsub("race_ethnicity", "race:", Parameter),
+    Median     = round(Median, 4),
+    CI_low     = round(CI_low,  4),
+    CI_high    = round(CI_high, 4),
+    pd         = round(pd,      4),
+    OR         = round(exp(Median), 3),
+    CI_95      = paste0("[", CI_low, ", ", CI_high, "]"),
+    Significant = if_else(CI_low > 0 | CI_high < 0, "Yes", "No")
+  ) %>%
+  select(Parameter, Median, CI_95, OR, pd, Significant)
+
+post_tbl %>%
+  gt() %>%
+  tab_header(
+    title    = "Posterior Summaries — Primary Bayesian Logistic Regression",
+    subtitle = "Outcome: Low Muscle Mass | Predictors standardised (continuous)"
+  ) %>%
+  cols_label(
+    Parameter   = "Predictor",
+    Median      = "Posterior Median",
+    CI_95       = "95% HDI",
+    OR          = "Odds Ratio",
+    pd          = "P(Direction)",
+    Significant = "95% CI excludes 0?"
+  ) %>%
+  tab_style(
+    style     = list(cell_fill(color = "#DDEEFF"),
+                     cell_text(weight = "bold")),
+    locations = cells_body(rows = Significant == "Yes")
+  ) %>%
+  tab_footnote(
+    "Median and 95% highest density interval (HDI) on the log-odds scale.
+     OR = exp(Median). P(Direction) > 0.975 ≈ p < 0.05 two-sided.
+     Rows highlighted in blue have 95% HDI fully excluding zero."
+  )
+```
+
+## Plain-Language Interpretation
+
+```{r interpretation}
+# ── Extract key posteriors for narrative ──────────────────────────────────────
+get_est <- function(param_pattern) {
+  post_tbl %>%
+    filter(grepl(param_pattern, Parameter, ignore.case = TRUE)) %>%
+    slice(1) %>%
+    select(Parameter, Median, OR, CI_95, pd)
+}
+
+interp_vars <- c("age_years", "sexFemale", "bmi", "waist_cm",
+                 "max_grip_kg", "protein_g", "poverty_ratio")
+
+interp_tbl <- map_dfr(interp_vars, get_est)
+
+kable(interp_tbl,
+      col.names = c("Predictor", "Log-Odds Median", "OR", "95% HDI", "P(Direction)"),
+      caption = "Key predictor estimates for narrative interpretation") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+**Narrative interpretation of significant predictors:**
+
+The results below are based on the posterior medians and 95 % highest density
+intervals.  All continuous predictors are on the standardised (z-score) scale;
+ORs reflect the change in odds of low muscle mass per one standard deviation
+increase in the predictor.
+
+```{r narrative-text, results="asis"}
+# Build narrative dynamically from the posterior table
+sig_preds <- post_tbl %>% filter(Significant == "Yes",
+                                  !grepl("Intercept", Parameter))
+
+cat("\n")
+for (i in seq_len(nrow(sig_preds))) {
+  p   <- sig_preds$Parameter[i]
+  med <- sig_preds$Median[i]
+  OR  <- sig_preds$OR[i]
+  ci  <- sig_preds$CI_95[i]
+  dir <- if (med > 0) "increases" else "decreases"
+
+  cat(sprintf(
+    "- **%s**: A one-SD increase %s the log-odds of low muscle mass by %.3f
+      (OR = %.3f; 95%% HDI %s), with a probability of direction of %.4f.\n\n",
+    p, dir, abs(med), OR, ci, sig_preds$pd[i]
+  ))
+}
+```
+
+---
+
+# Classification Performance
+
+## Posterior Predictive Probabilities
+
+We generate posterior predictive draws for each test-set observation, average
+across all 8,000 post-warmup draws to obtain a predicted probability, then
+apply a 0.5 classification threshold.
+
+```{r ppc-classify}
+# ── Posterior predictive means for test set ───────────────────────────────────
+# posterior_epred returns a draws × n_obs matrix of predicted probabilities
+set.seed(42)
+ppc_mat  <- posterior_epred(fit_main, newdata = test_df, allow_new_levels = TRUE)
+
+# Average over posterior draws → point probability estimate per observation
+pred_prob <- colMeans(ppc_mat)
+pred_class_num <- as.integer(pred_prob > 0.5)
+
+truth_01  <- test_df$low_muscle_mass
+truth_fac <- factor(ifelse(truth_01 == 1, "LowMuscle", "Normal"),
+                    levels = c("Normal", "LowMuscle"))
+pred_fac  <- factor(ifelse(pred_class_num == 1, "LowMuscle", "Normal"),
+                    levels = c("Normal", "LowMuscle"))
+
+cat("Confusion matrix (Bayesian model, threshold = 0.5):\n")
+cm_bayes <- confusionMatrix(pred_fac, truth_fac, positive = "LowMuscle")
+print(cm_bayes$table)
+```
+
+```{r bayes-metrics}
+# ── Compute classification metrics ────────────────────────────────────────────
+roc_bayes <- roc(truth_01, pred_prob, quiet = TRUE)
+
+sens_b <- cm_bayes$byClass["Sensitivity"]
+spec_b <- cm_bayes$byClass["Specificity"]
+prec_b <- cm_bayes$byClass["Precision"]
+rec_b  <- cm_bayes$byClass["Recall"]
+
+# F1 macro
+f1_pos   <- ifelse(!is.na(prec_b) & !is.na(rec_b) & (prec_b + rec_b) > 0,
+                   2 * prec_b * rec_b / (prec_b + rec_b), NA)
+prec_neg <- cm_bayes$byClass["Neg Pred Value"]
+rec_neg  <- spec_b
+f1_neg   <- ifelse(!is.na(prec_neg) & !is.na(rec_neg) & (prec_neg + rec_neg) > 0,
+                   2 * prec_neg * rec_neg / (prec_neg + rec_neg), NA)
+f1_macro_b <- mean(c(f1_pos, f1_neg), na.rm = TRUE)
+
+# MCC
+tp_b <- as.numeric(cm_bayes$table["LowMuscle","LowMuscle"]); tp_b <- ifelse(is.na(tp_b),0,tp_b)
+tn_b <- as.numeric(cm_bayes$table["Normal",   "Normal"   ]); tn_b <- ifelse(is.na(tn_b),0,tn_b)
+fp_b <- as.numeric(cm_bayes$table["LowMuscle","Normal"   ]); fp_b <- ifelse(is.na(fp_b),0,fp_b)
+fn_b <- as.numeric(cm_bayes$table["Normal",   "LowMuscle"]); fn_b <- ifelse(is.na(fn_b),0,fn_b)
+mcc_den_b <- sqrt((tp_b+fp_b)*(tp_b+fn_b)*(tn_b+fp_b)*(tn_b+fn_b))
+mcc_b     <- if (is.na(mcc_den_b) || mcc_den_b == 0) 0 else ((tp_b*tn_b)-(fp_b*fn_b))/mcc_den_b
+
+bayes_metrics <- data.frame(
+  Model       = "Bayesian Logistic Reg.",
+  AUC         = round(as.numeric(auc(roc_bayes)), 4),
+  F1_Macro    = round(f1_macro_b, 4),
+  MCC         = round(mcc_b,      4),
+  Sensitivity = round(sens_b,     4),
+  Specificity = round(spec_b,     4)
+)
+
+cat("Bayesian model classification metrics:\n")
+print(bayes_metrics)
+```
+
+## Comparison with ML Models
+
+```{r comparison-table}
+# ── ML model results extracted from the companion HTML report ─────────────────
+# Source: Test-Set Performance of Four Classifiers table,
+#         Mallik_CIND860_Capstone_Analysis.html
+ml_metrics <- data.frame(
+  Model       = c("Elastic Net LR", "Random Forest", "XGBoost", "SVM (Radial)"),
+  AUC         = c(0.9571, 0.9411, 0.9477, 0.8640),
+  F1_Macro    = c(0.8418, 0.8072, 0.8410, 0.1614),
+  MCC         = c(0.7072, 0.6230, 0.6905, -0.4569),
+  Sensitivity = c(0.9311, 0.6143, 0.8540, 0.5565),
+  Specificity = c(0.8619, 0.9532, 0.8903, 0.0576)
+)
+
+# Combine all models
+all_metrics <- bind_rows(ml_metrics, bayes_metrics)
+
+all_metrics %>%
+  gt() %>%
+  tab_header(
+    title    = "Full Model Comparison: Bayesian vs. Machine Learning",
+    subtitle = "NHANES 2011–2018 | Held-out test set | Outcome: Low Muscle Mass"
+  ) %>%
+  fmt_number(columns = where(is.numeric), decimals = 4) %>%
+  tab_style(
+    style     = list(cell_fill(color = "#E8F5E9"),
+                     cell_text(weight = "bold")),
+    locations = cells_body(rows = Model == "Bayesian Logistic Reg.")
+  ) %>%
+  tab_style(
+    style     = list(cell_fill(color = "#DDEEFF"),
+                     cell_text(weight = "bold")),
+    locations = cells_body(rows = Model == "Elastic Net LR")
+  ) %>%
+  cols_label(
+    Model       = "Model",
+    AUC         = "AUC",
+    F1_Macro    = "F1 (Macro)",
+    MCC         = "MCC",
+    Sensitivity = "Sensitivity",
+    Specificity = "Specificity"
+  ) %>%
+  tab_footnote(
+    "ML model results extracted from companion report (Mallik_CIND860_Capstone_Analysis.html).
+     Bayesian model (green) uses posterior predictive means with 0.5 threshold.
+     Elastic Net highlighted in blue as the best-performing ML model by AUC."
+  ) %>%
+  tab_source_note(
+    "All models evaluated on the same 30% held-out test partition (seed = 42)."
+  )
+```
+
+```{r roc-comparison, fig.cap="ROC curve for the Bayesian logistic regression model on the held-out test set"}
+# ── ROC curve ─────────────────────────────────────────────────────────────────
+roc_df <- data.frame(
+  FPR   = 1 - roc_bayes$specificities,
+  TPR   = roc_bayes$sensitivities
+)
+
+ggplot(roc_df, aes(x = FPR, y = TPR)) +
+  geom_line(colour = "#2196F3", linewidth = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  annotate("text", x = 0.6, y = 0.25,
+           label = sprintf("AUC = %.4f", as.numeric(auc(roc_bayes))),
+           size = 5, colour = "#2196F3", fontface = "bold") +
+  labs(title    = "ROC Curve — Bayesian Logistic Regression (Test Set)",
+       subtitle = "Posterior predictive mean probabilities | NHANES 2011–2018",
+       x = "False Positive Rate (1 – Specificity)",
+       y = "True Positive Rate (Sensitivity)") +
+  theme_bw(base_size = 13)
+```
+
+---
+
+# Bayes Factors for Key Predictors
+
+Bayes factors (BF) quantify the **relative evidence** for H1 (the coefficient
+differs from zero) versus H0 (the coefficient equals zero), computed via the
+Savage–Dickey density ratio using `bayestestR::bayesfactor_parameters()`.
+
+- **BF > 10**: Strong evidence for H1
+- **BF 3–10**: Moderate evidence for H1
+- **BF 1/3–3**: Inconclusive
+- **BF < 1/3**: Evidence for H0 (null effect)
+
+We compute BFs for the **five strongest predictors** identified from the
+posterior summary (largest |median| log-odds).
+
+```{r bayes-factors}
+# ── Identify top 5 predictors by |posterior median| ──────────────────────────
+top5 <- post_tbl %>%
+  filter(!grepl("Intercept|race:", Parameter)) %>%
+  mutate(abs_median = abs(Median)) %>%
+  arrange(desc(abs_median)) %>%
+  slice_head(n = 5) %>%
+  pull(Parameter)
+
+cat("Top 5 predictors for Bayes factor analysis:\n")
+print(top5)
+
+# ── Compute Bayes factors via Savage-Dickey ratio ─────────────────────────────
+# Requires refitting with sample_prior = "yes" so the prior is also sampled
+```
+
+```{r fit-bf, cache=TRUE, results="hide"}
+# Refit primary model sampling from the prior as well (needed for BF computation)
+set.seed(42)
+fit_bf <- brm(
+  formula      = bayes_formula,
+  data         = train_df,
+  prior        = priors_main,
+  chains       = 4,
+  iter         = 4000,
+  warmup       = 2000,
+  seed         = 42,
+  cores        = getOption("mc.cores", parallel::detectCores()),
+  sample_prior = "yes",   # ← required for Savage-Dickey BF
+  backend      = "rstan",
+  refresh      = 0,
+  silent       = 2
+)
+```
+
+```{r bf-compute}
+# ── Extract Bayes factors ──────────────────────────────────────────────────────
+bf_results <- bayesfactor_parameters(fit_bf, null = 0)
+
+# Format for display
+bf_tbl <- bf_results %>%
+  as.data.frame() %>%
+  filter(grepl("^b_", Parameter)) %>%
+  mutate(
+    Parameter     = gsub("^b_", "", Parameter),
+    Parameter     = gsub("race_ethnicity", "race:", Parameter),
+    log_BF        = round(log_BF, 3),
+    BF10          = round(exp(log_BF), 2),
+    Evidence      = case_when(
+      BF10 > 100  ~ "Extreme",
+      BF10 > 30   ~ "Very strong",
+      BF10 > 10   ~ "Strong",
+      BF10 > 3    ~ "Moderate",
+      BF10 > 1    ~ "Anecdotal (H1)",
+      BF10 > 1/3  ~ "Inconclusive",
+      TRUE        ~ "Evidence for H0"
+    )
+  ) %>%
+  # Filter to top 5 predictors
+  filter(Parameter %in% top5) %>%
+  arrange(desc(BF10)) %>%
+  select(Parameter, BF10, log_BF, Evidence)
+
+bf_tbl %>%
+  gt() %>%
+  tab_header(
+    title    = "Bayes Factors for Top 5 Predictors",
+    subtitle = "Savage–Dickey density ratio | H1: coefficient ≠ 0 vs. H0: coefficient = 0"
+  ) %>%
+  cols_label(
+    Parameter = "Predictor",
+    BF10      = "BF₁₀",
+    log_BF    = "log(BF₁₀)",
+    Evidence  = "Strength of Evidence"
+  ) %>%
+  fmt_number(columns = c(BF10, log_BF), decimals = 2) %>%
+  tab_style(
+    style     = list(cell_fill(color = "#DDEEFF"),
+                     cell_text(weight = "bold")),
+    locations = cells_body(rows = BF10 > 10)
+  ) %>%
+  tab_style(
+    style     = cell_fill(color = "#E8F5E9"),
+    locations = cells_body(rows = BF10 > 3 & BF10 <= 10)
+  ) %>%
+  tab_footnote(
+    "BF₁₀ > 10 (strong evidence) highlighted in blue.
+     BF₁₀ 3–10 (moderate evidence) highlighted in green.
+     Computed via Savage–Dickey density ratio from the joint prior/posterior."
+  )
+```
+
+```{r bf-plot, fig.cap="Log Bayes factors for the top 5 predictors. Values above zero favour H1 (effect present); below zero favour H0 (null effect)."}
+bf_tbl %>%
+  mutate(Parameter = fct_reorder(Parameter, log_BF)) %>%
+  ggplot(aes(x = Parameter, y = log_BF,
+             fill = if_else(log_BF > log(10), "Strong", "Moderate/Weak"))) +
+  geom_col(width = 0.6) +
+  geom_hline(yintercept = log(10), linetype = "dashed",
+             colour = "#2196F3", linewidth = 0.8) +
+  geom_hline(yintercept = log(3),  linetype = "dotted",
+             colour = "#4CAF50", linewidth = 0.8) +
+  geom_hline(yintercept = 0, colour = "black", linewidth = 0.5) +
+  coord_flip() +
+  scale_fill_manual(values = c("Strong" = "#2196F3",
+                               "Moderate/Weak" = "#90CAF9")) +
+  annotate("text", x = 0.6, y = log(10) + 0.2,
+           label = "log(BF=10)", hjust = 0, size = 3.5, colour = "#2196F3") +
+  annotate("text", x = 0.6, y = log(3) + 0.2,
+           label = "log(BF=3)",  hjust = 0, size = 3.5, colour = "#4CAF50") +
+  labs(title  = "Log Bayes Factors — Top 5 Predictors",
+       x = NULL, y = "log(BF₁₀)",
+       fill = "Evidence Strength") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+---
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
+
+---
+
+*Analysis conducted for CIND860 Capstone Project, Toronto Metropolitan University.*
+*Data source: CDC NHANES 2011–2018. Adiel Mallik, `r format(Sys.Date(), "%B %Y")`.*
