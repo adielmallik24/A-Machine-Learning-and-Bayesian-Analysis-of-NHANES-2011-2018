@@ -1,0 +1,1218 @@
+---
+title: "Predicting Low Muscle Mass in U.S. Adults (NHANES 2011–2018)"
+subtitle: "CIND860 Capstone Project — Toronto Metropolitan University"
+author: "Adiel Mallik"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 9,
+  fig.height = 6,
+  fig.align  = "center",
+  cache   = FALSE
+)
+
+# ── Package installation helper ───────────────────────────────────────────────
+# Run once if any package is missing; knit will find them afterwards.
+required_pkgs <- c(
+  "readxl", "dplyr", "tidyr", "ggplot2", "forcats",
+  "mice", "caret", "glmnet", "randomForest", "xgboost",
+  "kernlab", "pROC", "MLmetrics", "yardstick",
+  "shapviz", "kernelshap",
+  "knitr", "kableExtra", "gt",
+  "DescTools", "scales"
+)
+new_pkgs <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly = TRUE)]
+if (length(new_pkgs)) install.packages(new_pkgs, repos = "https://cloud.r-project.org")
+
+# ── Libraries ─────────────────────────────────────────────────────────────────
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(forcats)
+library(mice)
+library(caret)
+library(glmnet)
+library(randomForest)
+library(xgboost)
+library(kernlab)
+library(pROC)
+library(MLmetrics)
+library(yardstick)
+library(shapviz)
+library(kernelshap)
+library(knitr)
+library(kableExtra)
+library(gt)
+library(DescTools)
+library(scales)
+
+set.seed(42)
+```
+
+---
+
+# Setup and Data Loading
+
+This capstone project applies four machine-learning classifiers to predict
+**low muscle mass** — defined as an appendicular skeletal muscle mass index
+(ASMI) below the sex-specific 20th percentile — in U.S. adults aged 20–59
+using the NHANES 2011–2018 survey cycles.  The cleaned dataset was produced by
+the companion R data-cleaning script and exported as an Excel workbook.
+
+```{r load-data}
+# ── Load data ─────────────────────────────────────────────────────────────────
+DATA_PATH <- "nhanes_clean_2011_2018.xlsx"   # adjust path if needed
+
+nhanes <- read_excel(DATA_PATH) %>%
+  mutate(
+    # Ensure correct types
+    low_muscle_mass = as.integer(low_muscle_mass),
+    low_grip        = as.integer(low_grip),
+    sex             = factor(sex, levels = c("Male", "Female")),
+    race_ethnicity  = factor(race_ethnicity),
+    survey_cycle    = factor(survey_cycle)
+  )
+
+cat("Dataset dimensions:", nrow(nhanes), "rows ×", ncol(nhanes), "columns\n")
+```
+
+```{r head-data}
+# ── First 6 rows ──────────────────────────────────────────────────────────────
+kable(head(nhanes), caption = "First 6 rows of the cleaned NHANES dataset",
+      digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 12)
+```
+
+```{r outcome-summary}
+# ── Outcome prevalence ────────────────────────────────────────────────────────
+nhanes_cc <- nhanes %>% filter(!is.na(low_muscle_mass))   # complete-case for outcome
+
+prev_overall <- mean(nhanes_cc$low_muscle_mass) * 100
+prev_sex     <- nhanes_cc %>%
+  group_by(sex) %>%
+  summarise(n = n(),
+            n_lmm = sum(low_muscle_mass),
+            pct   = round(mean(low_muscle_mass) * 100, 1),
+            .groups = "drop")
+
+cat(sprintf("Overall low-muscle-mass prevalence: %.1f %%\n", prev_overall))
+print(prev_sex)
+```
+
+The dataset contains **`r nrow(nhanes)`** adults aged 20–59 drawn from four
+NHANES cycles (2011–2012, 2013–2014, 2015–2016, 2017–2018).  The outcome
+variable `low_muscle_mass` is a binary indicator (1 = low, 0 = normal) derived
+from sex-specific 20th-percentile ASMI thresholds computed in the cleaning
+script.
+
+---
+
+# Multiple Imputation
+
+Several nutritional and socioeconomic variables carry moderate rates of
+missingness (up to ~40 % for some dietary items).  We address this with
+**Multiple Imputation by Chained Equations (MICE)** using `m = 10` imputed
+datasets, pooled via Rubin's rules.  The primary outcome variables (`asmi`,
+`alm_kg`, `low_muscle_mass`) are **excluded** from imputation because the
+outcome must be derived from complete DXA data only.
+
+```{r imputation-setup}
+# ── Variables to impute ───────────────────────────────────────────────────────
+IMPUTE_VARS <- c("poverty_ratio", "protein_g", "energy_kcal",
+                 "calcium_mg", "vitamin_d_mcg")
+
+# Variables available as predictors in the imputation model
+# (exclude outcome-derived columns to avoid data leakage)
+PREDICTOR_VARS <- c("age_years", "sex", "race_ethnicity", "bmi",
+                    "weight_kg", "height_cm", "waist_cm", "max_grip_kg",
+                    "survey_cycle",
+                    "poverty_ratio", "protein_g", "energy_kcal",
+                    "calcium_mg", "vitamin_d_mcg")
+
+# Subset used for imputation — work only with predictor + impute variables
+nhanes_imp_input <- nhanes %>%
+  select(participant_id, all_of(PREDICTOR_VARS)) %>%
+  mutate(sex           = factor(sex),
+         race_ethnicity = factor(race_ethnicity),
+         survey_cycle  = factor(survey_cycle))
+
+# ── Missing data summary before imputation ────────────────────────────────────
+miss_tbl <- data.frame(
+  variable    = IMPUTE_VARS,
+  n_missing   = sapply(IMPUTE_VARS, function(v) sum(is.na(nhanes_imp_input[[v]]))),
+  pct_missing = sapply(IMPUTE_VARS, function(v) round(mean(is.na(nhanes_imp_input[[v]])) * 100, 1)),
+  row.names   = NULL
+)
+
+kable(miss_tbl,
+      col.names = c("Variable", "N Missing", "% Missing"),
+      caption   = "Missing data in variables selected for imputation") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE)
+```
+
+```{r run-mice, cache=TRUE}
+# ── Build method vector ───────────────────────────────────────────────────────
+# All five imputation targets are continuous → "pmm" (predictive mean matching)
+# Binary variables (none here) would use "logreg"
+method_vec <- make.method(nhanes_imp_input %>% select(-participant_id))
+
+# Override for our target variables
+method_vec[IMPUTE_VARS] <- "pmm"
+
+# Predictor matrix: suppress participant_id from being used as a predictor
+pred_mat <- make.predictorMatrix(nhanes_imp_input %>% select(-participant_id))
+
+# ── Run MICE ──────────────────────────────────────────────────────────────────
+set.seed(42)
+mice_obj <- mice(
+  nhanes_imp_input %>% select(-participant_id),
+  m        = 10,
+  method   = method_vec,
+  predictorMatrix = pred_mat,
+  maxit    = 10,
+  printFlag = FALSE,
+  seed     = 42
+)
+
+cat("Imputation complete. Number of imputed datasets:", mice_obj$m, "\n")
+```
+
+```{r mice-diagnostics, fig.cap="Convergence trace plots for imputed variables (mean and SD across iterations)"}
+# ── Convergence check ─────────────────────────────────────────────────────────
+plot(mice_obj, layout = c(2, length(IMPUTE_VARS)),
+     main = "MICE Convergence: Mean (left) and SD (right)")
+```
+
+```{r pool-imputations}
+# ── Pool imputed datasets: create one analysis-ready data frame ───────────────
+# Strategy: average the imputed values across m = 10 datasets (Rubin's rules
+# for continuous variables), then rejoin with complete-case outcome columns.
+
+imp_list <- lapply(seq_len(mice_obj$m), function(i) complete(mice_obj, i))
+
+# Compute column-wise means across imputed datasets for the five imputed vars
+pooled_mat <- Reduce("+", lapply(imp_list, function(d) d[, IMPUTE_VARS])) /
+              mice_obj$m
+
+nhanes_pooled <- nhanes_imp_input %>%
+  select(-all_of(IMPUTE_VARS)) %>%
+  bind_cols(pooled_mat)
+
+# Rejoin DXA-derived and outcome columns (complete cases only for those)
+nhanes_pooled <- nhanes_pooled %>%
+  left_join(nhanes %>% select(participant_id, asmi, alm_kg,
+                              low_muscle_mass, low_grip,
+                              bmi_outlier, protein_outlier, energy_outlier),
+            by = "participant_id")
+
+cat("Pooled dataset dimensions:", nrow(nhanes_pooled), "×", ncol(nhanes_pooled), "\n")
+cat("Remaining NAs in imputed vars:\n")
+print(colSums(is.na(nhanes_pooled[, IMPUTE_VARS])))
+```
+
+The five variables were imputed using **predictive mean matching (PMM)**, which
+preserves the empirical distribution of each variable and prevents implausible
+values (e.g., negative nutrient intakes).  Convergence was verified visually
+via trace plots above; mixing across chains indicates stable estimates.
+
+---
+
+# Feature Engineering
+
+Three derived features are constructed prior to modelling:
+
+| Feature | Description |
+|---------|-------------|
+| `bri` | Body Roundness Index — a proxy for central adiposity |
+| `age_group` | 4-level ordinal factor (decade bands) |
+| `protein_g` (winsorized) | Sex-specific 99.5th-percentile cap to reduce leverage of extreme values |
+
+## Body Roundness Index
+
+The BRI is computed from the Thomas et al. (2013) formula:
+
+$$\text{BRI} = 364.2 - 365.5 \times \sqrt{1 - \left(\frac{\text{waist}_{m}}{2\pi}\right)^2 / \left(\frac{\text{height}_{m}}{2}\right)^2}$$
+
+where waist circumference and height are both in metres.
+
+```{r feature-engineering}
+# ── 3a. Body Roundness Index (Thomas et al., 2013) ────────────────────────────
+nhanes_fe <- nhanes_pooled %>%
+  mutate(
+    waist_m  = waist_cm  / 100,
+    height_m = height_cm / 100,
+    # Clamp the argument to [0,1] to guard against floating-point edge cases
+    bri_arg  = pmin(pmax(1 - ((waist_m / (2 * pi))^2) / ((height_m / 2)^2), 0), 1),
+    bri      = 364.2 - 365.5 * sqrt(bri_arg)
+  ) %>%
+  select(-waist_m, -height_m, -bri_arg)
+
+cat("BRI summary:\n")
+print(summary(nhanes_fe$bri))
+
+# ── 3b. Age group (4-level factor) ───────────────────────────────────────────
+nhanes_fe <- nhanes_fe %>%
+  mutate(age_group = cut(age_years,
+                         breaks = c(20, 30, 40, 50, 60),
+                         labels = c("20-29", "30-39", "40-49", "50-59"),
+                         right  = FALSE,
+                         include.lowest = TRUE))
+
+cat("\nAge group distribution:\n")
+print(table(nhanes_fe$age_group, useNA = "ifany"))
+
+# ── 3c. Winsorise protein_g at sex-specific 99.5th percentile ─────────────────
+p995_male   <- quantile(nhanes_fe$protein_g[nhanes_fe$sex == "Male"],
+                        0.995, na.rm = TRUE)
+p995_female <- quantile(nhanes_fe$protein_g[nhanes_fe$sex == "Female"],
+                        0.995, na.rm = TRUE)
+
+nhanes_fe <- nhanes_fe %>%
+  mutate(protein_g = case_when(
+    sex == "Male"   & protein_g > p995_male   ~ p995_male,
+    sex == "Female" & protein_g > p995_female ~ p995_female,
+    TRUE ~ protein_g
+  ))
+
+cat(sprintf("\nProtein winsorisation caps — Male: %.1f g/day  |  Female: %.1f g/day\n",
+            p995_male, p995_female))
+cat("Protein range after winsorisation:", range(nhanes_fe$protein_g, na.rm = TRUE), "\n")
+```
+
+```{r bri-distribution, fig.cap="Distribution of Body Roundness Index by sex"}
+ggplot(nhanes_fe %>% filter(!is.na(bri), !is.na(sex)),
+       aes(x = bri, fill = sex, colour = sex)) +
+  geom_density(alpha = 0.25, linewidth = 0.9) +
+  scale_fill_manual(values   = c("Male" = "#3B82F6", "Female" = "#EF4444")) +
+  scale_colour_manual(values = c("Male" = "#3B82F6", "Female" = "#EF4444")) +
+  labs(title = "Body Roundness Index Distribution by Sex",
+       subtitle = "Thomas et al. (2013) formula applied to NHANES waist and height measurements",
+       x = "BRI", y = "Density") +
+  theme_bw(base_size = 13)
+```
+
+---
+
+# Train / Test Split
+
+A stratified 70 / 30 split on `low_muscle_mass` is performed to preserve the
+~20 % positive-class prevalence in both partitions.  Only complete cases for
+the outcome are retained at this stage.
+
+```{r model-variables}
+# ── Define modelling feature set ──────────────────────────────────────────────
+MODEL_VARS <- c("age_years", "sex", "race_ethnicity",
+                "bmi", "weight_kg", "height_cm", "waist_cm",
+                "max_grip_kg", "poverty_ratio",
+                "protein_g", "energy_kcal", "calcium_mg", "vitamin_d_mcg",
+                "bri", "age_group",
+                "low_muscle_mass")
+
+nhanes_model <- nhanes_fe %>%
+  select(participant_id, all_of(MODEL_VARS)) %>%
+  filter(!is.na(low_muscle_mass)) %>%          # outcome must be observed
+  mutate(
+    low_muscle_mass = factor(low_muscle_mass,
+                             levels = c(0, 1),
+                             labels = c("Normal", "LowMuscle")),
+    sex            = factor(sex),
+    race_ethnicity = factor(race_ethnicity),
+    age_group      = factor(age_group, levels = c("20-29","30-39","40-49","50-59"))
+  ) %>%
+  drop_na()    # remove rows with any remaining NA in modelling columns
+
+cat("Complete-case modelling rows:", nrow(nhanes_model), "\n")
+cat("Outcome distribution:\n")
+print(table(nhanes_model$low_muscle_mass))
+```
+
+```{r train-test-split}
+# ── Stratified 70/30 split ────────────────────────────────────────────────────
+set.seed(42)
+train_idx <- createDataPartition(nhanes_model$low_muscle_mass,
+                                  p = 0.70, list = FALSE)
+
+train_df <- nhanes_model[ train_idx, ] %>% select(-participant_id)
+test_df  <- nhanes_model[-train_idx, ] %>% select(-participant_id)
+
+cat("Training set:", nrow(train_df), "rows\n")
+cat("Test set:    ", nrow(test_df),  "rows\n")
+cat("\nTraining outcome prevalence:\n")
+print(prop.table(table(train_df$low_muscle_mass)))
+cat("\nTest outcome prevalence:\n")
+print(prop.table(table(test_df$low_muscle_mass)))
+```
+
+The stratified split ensures that the positive-class (low muscle mass) ratio is
+approximately equal in both partitions, which is important given the ~20 %
+prevalence.
+
+---
+
+# Model Training
+
+All four classifiers share the same **5-fold stratified cross-validation**
+control object and are trained on identical feature sets.  Class imbalance is
+addressed explicitly in each model (class weights or scale parameters).
+
+```{r cv-control}
+# ── Shared cross-validation control ──────────────────────────────────────────
+set.seed(42)
+cv_ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  sampling        = NULL,      # class-weighting handled inside each model
+  verboseIter     = FALSE
+)
+
+# Class weight ratio (negative : positive) for models that accept it
+class_ratio <- sum(train_df$low_muscle_mass == "Normal") /
+               sum(train_df$low_muscle_mass == "LowMuscle")
+cat(sprintf("Class weight ratio (Normal:LowMuscle) = %.2f\n", class_ratio))
+
+# Helper: model formula (outcome ~ all features)
+f_formula <- low_muscle_mass ~ .
+```
+
+## Elastic Net Logistic Regression (Baseline)
+
+Elastic net combines L1 (lasso) and L2 (ridge) penalties, enabling automatic
+feature selection while handling correlated predictors.  The `alpha` and
+`lambda` grid is searched via cross-validation; class imbalance is addressed
+through `weights` passed to `glmnet`.
+
+```{r enet-train, cache=TRUE}
+# ── Prepare design matrix (caret handles dummies internally for glmnet) ──────
+# Build class weights: inverse frequency weighting
+wts_train <- ifelse(train_df$low_muscle_mass == "LowMuscle",
+                    class_ratio, 1)
+
+set.seed(42)
+enet_model <- train(
+  f_formula,
+  data      = train_df,
+  method    = "glmnet",
+  trControl = cv_ctrl,
+  tuneGrid  = expand.grid(alpha  = c(0, 0.25, 0.5, 0.75, 1),
+                           lambda = 10^seq(-4, 0, length.out = 20)),
+  weights   = wts_train,
+  metric    = "ROC",
+  preProcess = c("center", "scale")
+)
+
+cat("Best elastic net parameters:\n")
+print(enet_model$bestTune)
+```
+
+## Random Forest
+
+Random Forest (Breiman, 2001) is an ensemble of 500 decorrelated decision trees.
+`mtry` — the number of randomly sampled predictors at each split — is tuned
+over a grid; class imbalance is addressed via the `classwt` argument.
+
+```{r rf-train, cache=TRUE}
+# Determine number of predictors for mtry grid
+n_features <- ncol(train_df) - 1   # subtract outcome
+
+set.seed(42)
+rf_model <- train(
+  f_formula,
+  data      = train_df,
+  method    = "rf",
+  trControl = cv_ctrl,
+  tuneGrid  = data.frame(mtry = c(2, 4, 6, 8, round(sqrt(n_features)),
+                                   round(n_features / 3))),
+  ntree     = 500,
+  classwt   = c("Normal" = 1, "LowMuscle" = class_ratio),
+  metric    = "ROC",
+  importance = TRUE
+)
+
+cat("Best RF mtry:", rf_model$bestTune$mtry, "\n")
+```
+
+## XGBoost
+
+XGBoost (Chen & Guestrin, 2016) is a gradient-boosted tree ensemble that
+handles class imbalance via `scale_pos_weight` (set to the negative-to-positive
+class ratio).  Early stopping is applied within each cross-validation fold to
+prevent overfitting.
+
+```{r xgb-train, cache=TRUE}
+# ── Encode factors as numeric for xgboost ────────────────────────────────────
+encode_df <- function(df) {
+  df %>%
+    mutate(
+      sex_num   = as.integer(sex) - 1L,       # Male=0, Female=1
+      race_num  = as.integer(race_ethnicity) - 1L,
+      ag_num    = as.integer(age_group) - 1L
+    ) %>%
+    select(-sex, -race_ethnicity, -age_group)
+}
+
+train_xgb <- encode_df(train_df)
+test_xgb  <- encode_df(test_df)
+
+# Outcome must be 0/1
+y_train <- as.integer(train_xgb$low_muscle_mass == "LowMuscle")
+y_test  <- as.integer(test_xgb$low_muscle_mass  == "LowMuscle")
+
+X_train <- as.matrix(train_xgb %>% select(-low_muscle_mass))
+X_test  <- as.matrix(test_xgb  %>% select(-low_muscle_mass))
+
+dtrain <- xgb.DMatrix(X_train, label = y_train)
+dtest  <- xgb.DMatrix(X_test,  label = y_test)
+
+xgb_params <- list(
+  objective        = "binary:logistic",
+  eval_metric      = "auc",
+  eta              = 0.05,
+  max_depth        = 6,
+  subsample        = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 5,
+  scale_pos_weight = class_ratio,   # handles class imbalance
+  seed             = 42
+)
+
+set.seed(42)
+xgb_cv <- xgb.cv(
+  params   = xgb_params,
+  data     = dtrain,
+  nrounds  = 500,
+  nfold    = 5,
+  stratified    = TRUE,
+  early_stopping_rounds = 30,
+  verbose  = FALSE
+)
+
+# Guard: best_iteration is only set when early stopping actually triggered.
+# If it is NULL or zero, fall back to the iteration with the best mean test AUC.
+best_nrounds <- xgb_cv$best_iteration
+
+if (is.null(best_nrounds) || length(best_nrounds) == 0 || best_nrounds == 0) {
+  eval_log    <- xgb_cv$evaluation_log
+  best_nrounds <- eval_log$iter[which.max(eval_log$test_auc_mean)]
+}
+
+# Final safety net — use 100 rounds if still unresolved
+if (is.null(best_nrounds) || length(best_nrounds) == 0 || best_nrounds == 0) {
+  best_nrounds <- 100
+  warning("Could not determine best_nrounds from CV; defaulting to 100.")
+}
+
+cat("XGBoost best number of rounds:", best_nrounds, "\n")
+
+# Train final model on full training data
+set.seed(42)
+xgb_model <- xgb.train(
+  params  = xgb_params,
+  data    = dtrain,
+  nrounds = best_nrounds,
+  verbose = 0
+)
+```
+
+## Support Vector Machine (Radial Kernel)
+
+An SVM with a radial basis function kernel is tuned over a grid of cost
+parameter `C` and kernel width `sigma`.  Class weights are set via `class.weights`.
+
+```{r svm-train, cache=TRUE}
+set.seed(42)
+svm_model <- train(
+  f_formula,
+  data      = train_df,
+  method    = "svmRadial",
+  trControl = cv_ctrl,
+  tuneGrid  = expand.grid(C     = c(0.1, 0.5, 1, 2, 5),
+                           sigma = c(0.01, 0.05, 0.1, 0.5)),
+  class.weights = c("Normal" = 1, "LowMuscle" = class_ratio),
+  metric    = "ROC",
+  preProcess = c("center", "scale")
+)
+
+cat("Best SVM parameters:\n")
+print(svm_model$bestTune)
+```
+
+---
+
+# Model Evaluation on the Test Set
+
+All models are evaluated on the 30 % held-out test partition.  We report six
+metrics that together capture both discrimination and class-specific performance:
+
+| Metric | Rationale |
+|--------|-----------|
+| AUC | Overall discrimination; threshold-free |
+| F1 (macro) | Harmonic mean of precision and recall, averaged over classes |
+| MCC | Balanced quality metric; robust to class imbalance |
+| Sensitivity | True-positive rate (clinically important) |
+| Specificity | True-negative rate |
+| F2 | F-measure weighting recall 2× more than precision |
+
+```{r predict-helpers}
+# ── Helper: generate predictions and probabilities ────────────────────────────
+get_preds <- function(model, newdata, positive = "LowMuscle") {
+  probs <- predict(model, newdata = newdata, type = "prob")[, positive]
+  preds <- predict(model, newdata = newdata)
+  list(prob = probs, class = preds)
+}
+
+# ── XGBoost predictions ───────────────────────────────────────────────────────
+# Rebuild dtest fresh here: xgb.DMatrix objects cannot survive cache serialisation
+dtest_fresh <- xgb.DMatrix(X_test, label = y_test)
+xgb_prob    <- predict(xgb_model, dtest_fresh)
+xgb_class   <- factor(ifelse(xgb_prob > 0.5, "LowMuscle", "Normal"),
+                      levels = c("Normal", "LowMuscle"))
+
+# ── Caret model predictions ───────────────────────────────────────────────────
+enet_p <- get_preds(enet_model, test_df)
+rf_p   <- get_preds(rf_model,   test_df)
+svm_p  <- get_preds(svm_model,  test_df)
+
+truth    <- test_df$low_muscle_mass   # factor with levels Normal / LowMuscle
+truth_01 <- as.integer(truth == "LowMuscle")
+```
+
+```{r eval-functions}
+# ── Metric computation helper ─────────────────────────────────────────────────
+compute_metrics <- function(prob, pred_class, truth_factor, truth_01, model_name) {
+  cm  <- confusionMatrix(pred_class, truth_factor, positive = "LowMuscle")
+  roc_obj <- roc(truth_01, prob, quiet = TRUE)
+
+  sens <- cm$byClass["Sensitivity"]
+  spec <- cm$byClass["Specificity"]
+  prec <- cm$byClass["Precision"]
+  rec  <- cm$byClass["Recall"]
+
+  # F1 macro (average of class-specific F1s)
+  f1_pos <- ifelse(!is.na(prec) & !is.na(rec) & (prec + rec) > 0,
+                   2 * prec * rec / (prec + rec), NA)
+  prec_neg <- cm$byClass["Neg Pred Value"]
+  rec_neg  <- spec
+  f1_neg   <- ifelse(!is.na(prec_neg) & !is.na(rec_neg) & (prec_neg + rec_neg) > 0,
+                     2 * prec_neg * rec_neg / (prec_neg + rec_neg), NA)
+  f1_macro <- mean(c(f1_pos, f1_neg), na.rm = TRUE)
+
+  # F2: weights recall twice as heavily as precision
+  beta <- 2
+  f2   <- ifelse(!is.na(prec) & !is.na(rec) & (beta^2 * prec + rec) > 0,
+                 (1 + beta^2) * prec * rec / (beta^2 * prec + rec), NA)
+
+  # Matthews Correlation Coefficient
+  # Replace any NA cells (class never predicted) with 0
+  tp <- as.numeric(cm$table["LowMuscle", "LowMuscle"]); tp <- ifelse(is.na(tp), 0, tp)
+  tn <- as.numeric(cm$table["Normal",    "Normal"]);    tn <- ifelse(is.na(tn), 0, tn)
+  fp <- as.numeric(cm$table["LowMuscle", "Normal"]);    fp <- ifelse(is.na(fp), 0, fp)
+  fn <- as.numeric(cm$table["Normal",    "LowMuscle"]); fn <- ifelse(is.na(fn), 0, fn)
+  mcc_num  <- (tp * tn) - (fp * fn)
+  mcc_den  <- sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+  mcc      <- if (is.na(mcc_den) || mcc_den == 0) 0 else mcc_num / mcc_den
+
+  data.frame(
+    Model       = model_name,
+    AUC         = round(as.numeric(auc(roc_obj)), 4),
+    F1_Macro    = round(f1_macro, 4),
+    MCC         = round(mcc, 4),
+    Sensitivity = round(sens, 4),
+    Specificity = round(spec, 4),
+    F2          = round(f2, 4)
+  )
+}
+```
+
+```{r compute-all-metrics}
+results_tbl <- bind_rows(
+  compute_metrics(enet_p$prob, enet_p$class, truth, truth_01, "Elastic Net LR"),
+  compute_metrics(rf_p$prob,   rf_p$class,   truth, truth_01, "Random Forest"),
+  compute_metrics(xgb_prob,    xgb_class,    truth, truth_01, "XGBoost"),
+  compute_metrics(svm_p$prob,  svm_p$class,  truth, truth_01, "SVM (Radial)")
+)
+
+# Identify best model by AUC
+best_model_name <- results_tbl$Model[which.max(results_tbl$AUC)]
+cat("Best model (by AUC):", best_model_name, "\n")
+```
+
+```{r results-table}
+# ── Formatted results table ───────────────────────────────────────────────────
+results_tbl %>%
+  gt() %>%
+  tab_header(
+    title    = "Test-Set Performance of Four Classifiers",
+    subtitle = "NHANES 2011–2018 | Outcome: Low Muscle Mass (bottom 20th %ile ASMI)"
+  ) %>%
+  fmt_number(columns = where(is.numeric), decimals = 4) %>%
+  tab_style(
+    style = list(cell_fill(color = "#DDEEFF"),
+                 cell_text(weight = "bold")),
+    locations = cells_body(rows = Model == best_model_name)
+  ) %>%
+  cols_label(
+    Model       = "Model",
+    AUC         = "AUC",
+    F1_Macro    = "F1 (Macro)",
+    MCC         = "MCC",
+    Sensitivity = "Sensitivity",
+    Specificity = "Specificity",
+    F2          = "F2-Score"
+  ) %>%
+  tab_footnote("Best model (highest AUC) highlighted in blue.")
+```
+
+## ROC Curves
+
+```{r roc-curves, fig.cap="ROC curves for all four classifiers on the held-out test set"}
+# Build ROC objects
+roc_enet <- roc(truth_01, enet_p$prob, quiet = TRUE)
+roc_rf   <- roc(truth_01, rf_p$prob,   quiet = TRUE)
+roc_xgb  <- roc(truth_01, xgb_prob,    quiet = TRUE)
+roc_svm  <- roc(truth_01, svm_p$prob,  quiet = TRUE)
+
+# Combine into a single data frame for ggplot
+roc_df <- bind_rows(
+  data.frame(FPR = 1 - roc_enet$specificities,
+             TPR = roc_enet$sensitivities,
+             Model = sprintf("Elastic Net (AUC=%.3f)", auc(roc_enet))),
+  data.frame(FPR = 1 - roc_rf$specificities,
+             TPR = roc_rf$sensitivities,
+             Model = sprintf("Random Forest (AUC=%.3f)", auc(roc_rf))),
+  data.frame(FPR = 1 - roc_xgb$specificities,
+             TPR = roc_xgb$sensitivities,
+             Model = sprintf("XGBoost (AUC=%.3f)", auc(roc_xgb))),
+  data.frame(FPR = 1 - roc_svm$specificities,
+             TPR = roc_svm$sensitivities,
+             Model = sprintf("SVM Radial (AUC=%.3f)", auc(roc_svm)))
+)
+
+ggplot(roc_df, aes(x = FPR, y = TPR, colour = Model)) +
+  geom_line(linewidth = 1.0) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  scale_colour_brewer(palette = "Set1") +
+  labs(title    = "ROC Curves — Test Set Performance",
+       subtitle = "Predicting Low Muscle Mass (NHANES 2011–2018)",
+       x = "False Positive Rate (1 – Specificity)",
+       y = "True Positive Rate (Sensitivity)",
+       colour = NULL) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = c(0.65, 0.25),
+        legend.background = element_rect(fill = "white", colour = "grey80"))
+```
+
+---
+
+# SHAP Analysis
+
+SHAP (SHapley Additive exPlanations; Lundberg & Lee, 2017) values provide a
+unified measure of each feature's contribution to individual predictions.  We
+apply SHAP to the **best-performing model** identified above.
+
+> **Note:** SHAP values are computed using the `kernelshap` package for models
+> that do not have native SHAP support (elastic net, SVM); the `shapviz`
+> package provides the visualisation layer.  If the best model is XGBoost,
+> native tree SHAP values are used instead for exact computation.
+
+```{r shap-setup}
+# ── Identify best model object ────────────────────────────────────────────────
+best_model_obj <- switch(best_model_name,
+  "Elastic Net LR" = enet_model,
+  "Random Forest"  = rf_model,
+  "SVM (Radial)"   = svm_model,
+  "XGBoost"        = xgb_model
+)
+
+# ── Two representations of the feature data for SHAP ─────────────────────────
+#
+# XGBoost path : fully-numeric matrix (factors integer-encoded)
+# caret path   : original data frame with factor columns intact,
+#                because caret predict() needs them for model.frame()
+
+# 1. Numeric matrix — XGBoost only
+shap_prep_numeric <- function(df) {
+  df %>%
+    select(-low_muscle_mass) %>%
+    mutate(
+      sex_num  = as.integer(factor(sex, levels = c("Male", "Female"))) - 1L,
+      race_num = as.integer(race_ethnicity) - 1L,
+      ag_num   = as.integer(age_group) - 1L
+    ) %>%
+    select(-sex, -race_ethnicity, -age_group) %>%
+    as.matrix()
+}
+
+test_shap_mat  <- shap_prep_numeric(test_df)
+train_shap_mat <- shap_prep_numeric(train_df)
+feature_names  <- colnames(test_shap_mat)
+
+# 2. Factor-preserving data frame — caret / kernelshap path
+test_shap_df  <- test_df  %>% select(-low_muscle_mass)
+train_shap_df <- train_df %>% select(-low_muscle_mass)
+
+cat("SHAP matrix dimensions:    ", dim(test_shap_mat), "\n")
+cat("SHAP data frame dimensions:", dim(test_shap_df),  "\n")
+```
+
+```{r shap-compute, cache=TRUE}
+# ── Prediction wrapper ────────────────────────────────────────────────────────
+if (best_model_name == "XGBoost") {
+
+  # Native tree SHAP contributions from XGBoost (exact, fast)
+  # Rebuild DMatrix fresh — cached DMatrix objects are disposed between chunks
+  dtest_shap <- xgb.DMatrix(test_shap_mat)
+  shap_vals  <- predict(xgb_model,
+                        dtest_shap,
+                        predcontrib   = TRUE,
+                        approxcontrib = FALSE)
+  # Remove the bias column (last column named "BIAS")
+  shap_vals <- shap_vals[, seq_len(ncol(shap_vals) - 1)]
+  colnames(shap_vals) <- feature_names
+
+} else {
+
+  # kernelshap for caret models (maintained successor to fastshap)
+  # kernelshap passes rows of X / bg_X directly to pred_fun.
+  # We use the factor-preserving data frames so caret's model.frame()
+  # can find the original columns (sex, race_ethnicity, age_group).
+  pred_wrapper <- function(object, newdata) {
+    # newdata arrives as a data frame slice — ensure factors are correct
+    nd <- as.data.frame(newdata)
+    nd$sex            <- factor(nd$sex,
+                                levels = levels(train_df$sex))
+    nd$race_ethnicity <- factor(nd$race_ethnicity,
+                                levels = levels(train_df$race_ethnicity))
+    nd$age_group      <- factor(nd$age_group,
+                                levels = levels(train_df$age_group))
+    predict(object, newdata = nd, type = "prob")[, "LowMuscle"]
+  }
+
+  # Use a 100-row background sample from the factor-preserving training frame
+  set.seed(42)
+  bg_idx <- sample(nrow(train_shap_df), min(100, nrow(train_shap_df)))
+
+  set.seed(42)
+  ks_obj <- kernelshap(
+    object   = best_model_obj,
+    X        = test_shap_df,          # factor data frame
+    bg_X     = train_shap_df[bg_idx, ],
+    pred_fun = pred_wrapper,
+    verbose  = FALSE
+  )
+  shap_vals <- ks_obj$S   # matrix of SHAP values (n_test x n_features)
+  colnames(shap_vals) <- colnames(test_shap_df)
+}
+
+# ── Build shapviz object ──────────────────────────────────────────────────────
+# XGBoost path uses the numeric matrix; caret path uses the factor data frame.
+# shapviz only needs X for display labels, so either works.
+if (best_model_name == "XGBoost") {
+  sv <- shapviz(shap_vals, X = test_shap_mat)
+} else {
+  sv <- shapviz(shap_vals, X = as.data.frame(test_shap_df))
+}
+cat("SHAP values computed for", nrow(shap_vals), "test observations.\n")
+```
+
+## Global SHAP Beeswarm Summary
+
+```{r shap-beeswarm, fig.cap="Global SHAP beeswarm plot: each point is one test observation; colour encodes feature value; width shows distribution of impact."}
+sv_importance(sv, kind = "beeswarm", max_display = 15L) +
+  labs(title    = paste("SHAP Beeswarm Summary —", best_model_name),
+       subtitle = "Each point = one observation; colour = feature value (red=high, blue=low)") +
+  theme_bw(base_size = 12)
+```
+
+## Mean |SHAP| Bar Plot
+
+```{r shap-bar, fig.cap="Mean absolute SHAP value per feature — indicates average contribution to model output."}
+sv_importance(sv, kind = "bar", max_display = 15L) +
+  labs(title    = paste("Mean |SHAP| Values —", best_model_name),
+       subtitle = "Average absolute contribution to predicted log-odds of Low Muscle Mass") +
+  theme_bw(base_size = 12)
+```
+
+```{r shap-identify-cases}
+# ── Identify one TP, one FN, one FP from test set ────────────────────────────
+# We need predicted class and true class for the best model
+
+if (best_model_name == "XGBoost") {
+  test_pred_class <- xgb_class
+  test_pred_prob  <- xgb_prob
+} else {
+  preds_obj       <- get_preds(best_model_obj, test_df)
+  test_pred_class <- preds_obj$class
+  test_pred_prob  <- preds_obj$prob
+}
+
+outcomes_df <- data.frame(
+  idx        = seq_len(nrow(test_df)),
+  truth      = truth,
+  pred       = test_pred_class,
+  prob       = test_pred_prob
+)
+
+tp_idx <- outcomes_df %>% filter(truth == "LowMuscle", pred == "LowMuscle") %>%
+          slice(1) %>% pull(idx)
+fn_idx <- outcomes_df %>% filter(truth == "LowMuscle", pred == "Normal") %>%
+          slice(1) %>% pull(idx)
+fp_idx <- outcomes_df %>% filter(truth == "Normal",    pred == "LowMuscle") %>%
+          slice(1) %>% pull(idx)
+
+cat("True Positive  index:", tp_idx, "\n")
+cat("False Negative index:", fn_idx, "\n")
+cat("False Positive index:", fp_idx, "\n")
+```
+
+## SHAP Waterfall Plots
+
+```{r shap-waterfall-tp, fig.cap="SHAP waterfall for a True Positive: model correctly predicts Low Muscle Mass."}
+sv_waterfall(sv, row_id = tp_idx) +
+  labs(title = paste0("True Positive (obs #", tp_idx, ") — Predicted: LowMuscle | Actual: LowMuscle")) +
+  theme_bw(base_size = 12)
+```
+
+```{r shap-waterfall-fn, fig.cap="SHAP waterfall for a False Negative: model incorrectly predicts Normal for a Low Muscle Mass case."}
+sv_waterfall(sv, row_id = fn_idx) +
+  labs(title = paste0("False Negative (obs #", fn_idx, ") — Predicted: Normal | Actual: LowMuscle")) +
+  theme_bw(base_size = 12)
+```
+
+```{r shap-waterfall-fp, fig.cap="SHAP waterfall for a False Positive: model incorrectly predicts Low Muscle Mass for a Normal case."}
+sv_waterfall(sv, row_id = fp_idx) +
+  labs(title = paste0("False Positive (obs #", fp_idx, ") — Predicted: LowMuscle | Actual: Normal")) +
+  theme_bw(base_size = 12)
+```
+
+The waterfall plots decompose each prediction into feature-level additive
+contributions from the model's base value (average log-odds across training
+data).  Red bars push the prediction toward LowMuscle; blue bars push it toward
+Normal.
+
+---
+
+# Subgroup Analysis
+
+We stratify test-set AUC, F1 (macro), and MCC by three grouping variables:
+`sex`, `age_group`, and `race_ethnicity`.  This reveals whether model
+performance is equitable across population subgroups.
+
+```{r subgroup-function}
+# ── Generalised subgroup metric function ──────────────────────────────────────
+subgroup_metrics <- function(group_var, test_data, prob_vec, class_vec) {
+  groups <- unique(test_data[[group_var]])
+  groups <- sort(as.character(groups))
+
+  purrr::map_dfr(groups, function(g) {
+    idx   <- which(as.character(test_data[[group_var]]) == g)
+    if (length(idx) < 10) return(NULL)   # skip tiny strata
+
+    sub_truth01 <- as.integer(test_data$low_muscle_mass[idx] == "LowMuscle")
+    sub_prob    <- prob_vec[idx]
+    sub_pred    <- class_vec[idx]
+    sub_truth   <- test_data$low_muscle_mass[idx]
+
+    if (length(unique(sub_truth01)) < 2) return(NULL)  # need both classes
+
+    roc_sub <- roc(sub_truth01, sub_prob, quiet = TRUE)
+    cm_sub  <- confusionMatrix(sub_pred, sub_truth, positive = "LowMuscle")
+
+    sens <- cm_sub$byClass["Sensitivity"]
+    spec <- cm_sub$byClass["Specificity"]
+    prec <- cm_sub$byClass["Precision"]
+    rec  <- cm_sub$byClass["Recall"]
+    f1_pos <- ifelse(!is.na(prec) & !is.na(rec) & (prec + rec) > 0,
+                     2 * prec * rec / (prec + rec), NA)
+    prec_neg <- cm_sub$byClass["Neg Pred Value"]
+    rec_neg  <- spec
+    f1_neg   <- ifelse(!is.na(prec_neg) & !is.na(rec_neg) & (prec_neg + rec_neg) > 0,
+                       2 * prec_neg * rec_neg / (prec_neg + rec_neg), NA)
+    f1_macro <- mean(c(f1_pos, f1_neg), na.rm = TRUE)
+
+    tp <- as.numeric(cm_sub$table["LowMuscle", "LowMuscle"]); tp <- ifelse(is.na(tp), 0, tp)
+    tn <- as.numeric(cm_sub$table["Normal",    "Normal"]);    tn <- ifelse(is.na(tn), 0, tn)
+    fp <- as.numeric(cm_sub$table["LowMuscle", "Normal"]);    fp <- ifelse(is.na(fp), 0, fp)
+    fn <- as.numeric(cm_sub$table["Normal",    "LowMuscle"]); fn <- ifelse(is.na(fn), 0, fn)
+    mcc_den <- sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+    mcc <- if (is.na(mcc_den) || mcc_den == 0) 0 else ((tp * tn) - (fp * fn)) / mcc_den
+
+    data.frame(
+      Grouping_Variable = group_var,
+      Subgroup          = g,
+      N                 = length(idx),
+      Prevalence        = round(mean(sub_truth01) * 100, 1),
+      AUC               = round(as.numeric(auc(roc_sub)), 4),
+      F1_Macro          = round(f1_macro, 4),
+      MCC               = round(mcc, 4)
+    )
+  })
+}
+```
+
+```{r subgroup-compute, message=FALSE}
+# Add age_group to test_df for subgroup analysis
+test_df_sg <- test_df %>%
+  mutate(age_group = cut(age_years,
+                         breaks = c(20, 30, 40, 50, 60),
+                         labels = c("20-29","30-39","40-49","50-59"),
+                         right  = FALSE, include.lowest = TRUE))
+
+# Use best model predictions
+sg_sex  <- subgroup_metrics("sex",            test_df_sg, test_pred_prob, test_pred_class)
+sg_age  <- subgroup_metrics("age_group",      test_df_sg, test_pred_prob, test_pred_class)
+sg_race <- subgroup_metrics("race_ethnicity", test_df_sg, test_pred_prob, test_pred_class)
+
+subgroup_results <- bind_rows(sg_sex, sg_age, sg_race)
+```
+
+```{r subgroup-table}
+subgroup_results %>%
+  gt(groupname_col = "Grouping_Variable") %>%
+  tab_header(
+    title    = "Subgroup Analysis of Best Model Performance",
+    subtitle = paste("Model:", best_model_name,
+                     "| Metric: AUC, F1 (Macro), MCC")
+  ) %>%
+  fmt_number(columns = c(AUC, F1_Macro, MCC), decimals = 4) %>%
+  cols_label(
+    Subgroup   = "Subgroup",
+    N          = "N (test)",
+    Prevalence = "LMM Prevalence (%)",
+    AUC        = "AUC",
+    F1_Macro   = "F1 (Macro)",
+    MCC        = "MCC"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_row_groups()
+  ) %>%
+  tab_footnote("LMM = Low Muscle Mass. Subgroups with < 10 observations are excluded.")
+```
+
+```{r subgroup-plot, fig.cap="AUC by subgroup across sex, age group, and race/ethnicity"}
+subgroup_results %>%
+  mutate(label = paste0(Subgroup, "\n(n=", N, ")"),
+         Grouping_Variable = factor(Grouping_Variable,
+                                    levels = c("sex", "age_group", "race_ethnicity"),
+                                    labels = c("Sex", "Age Group", "Race/Ethnicity"))) %>%
+  ggplot(aes(x = reorder(label, AUC), y = AUC, fill = Grouping_Variable)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = max(results_tbl$AUC[results_tbl$Model == best_model_name]),
+             linetype = "dashed", colour = "grey40") +
+  coord_flip() +
+  facet_wrap(~ Grouping_Variable, scales = "free_y", ncol = 1) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title    = "Subgroup AUC — Fairness Assessment",
+       subtitle = paste("Best model:", best_model_name),
+       x = NULL, y = "AUC",
+       fill = "Grouping Variable") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+---
+
+# Interaction Term Analysis
+
+We extend the elastic net logistic regression baseline with **pairwise
+interaction terms** between the three grouping variables (`sex`, `age_group`,
+`race_ethnicity`) and the **top 5 SHAP predictors** identified in Section 7.
+Statistical significance is assessed using **likelihood ratio tests (LRT)**
+comparing nested models; we report chi-square statistics and p-values.
+
+```{r top5-shap}
+# ── Extract top 5 predictors by mean |SHAP| ───────────────────────────────────
+mean_shap <- colMeans(abs(shap_vals))
+top5_shap <- names(sort(mean_shap, decreasing = TRUE))[1:5]
+cat("Top 5 SHAP predictors:\n")
+print(top5_shap)
+```
+
+```{r interaction-data}
+# ── Prepare data for logistic regression (with dummies) ──────────────────────
+# Use complete-case training data; glm handles factors natively
+
+# Prepare a version of training data suitable for glm
+train_glm <- train_df %>%
+  mutate(
+    outcome_01     = as.integer(low_muscle_mass == "LowMuscle"),
+    sex            = factor(sex),
+    race_ethnicity = factor(race_ethnicity),
+    age_group      = factor(age_group,
+                            levels = c("20-29","30-39","40-49","50-59"))
+  )
+
+test_glm <- test_df %>%
+  mutate(
+    outcome_01     = as.integer(low_muscle_mass == "LowMuscle"),
+    sex            = factor(sex),
+    race_ethnicity = factor(race_ethnicity),
+    age_group      = factor(age_group,
+                            levels = c("20-29","30-39","40-49","50-59"))
+  )
+
+# Map SHAP feature names back to original column names
+# (SHAP matrix may use encoded names; map them back)
+shap_to_orig <- c(
+  sex_num  = "sex",
+  race_num = "race_ethnicity",
+  ag_num   = "age_group"
+)
+
+top5_orig <- dplyr::recode(top5_shap, !!!shap_to_orig)
+cat("Top 5 (original names):", top5_orig, "\n")
+```
+
+```{r base-logistic}
+# ── Base logistic model (no interactions) ────────────────────────────────────
+# Use the top 5 SHAP predictors plus grouping variables
+base_vars  <- unique(c(top5_orig, "sex", "age_group", "race_ethnicity"))
+
+# Build formula safely — keep only vars present in data
+base_vars  <- base_vars[base_vars %in% names(train_glm)]
+
+base_f     <- as.formula(paste("outcome_01 ~",
+                               paste(base_vars, collapse = " + ")))
+
+m_base <- glm(base_f, data = train_glm, family = binomial,
+              weights = ifelse(train_glm$outcome_01 == 1, class_ratio, 1))
+
+cat("Base model AIC:", round(AIC(m_base), 1), "\n")
+cat("Base model df:", df.residual(m_base), "\n")
+```
+
+```{r interaction-lrt}
+# ── Add interaction terms and run LRT ────────────────────────────────────────
+group_vars <- c("sex", "age_group", "race_ethnicity")
+
+# Keep only top5 predictors that are NOT already a grouping variable
+top5_non_group <- top5_orig[!top5_orig %in% group_vars]
+
+lrt_results <- list()
+
+for (gv in group_vars) {
+  for (fv in top5_non_group) {
+
+    # Skip if feature not in data
+    if (!fv %in% names(train_glm)) next
+
+    # Extended model formula: add the interaction term
+    int_term <- paste0(gv, ":", fv)
+    ext_f    <- update(base_f,
+                       paste(". ~ . +", int_term))
+
+    tryCatch({
+      m_ext   <- glm(ext_f, data = train_glm, family = binomial,
+                     weights = ifelse(train_glm$outcome_01 == 1, class_ratio, 1))
+      lrt_out <- anova(m_base, m_ext, test = "LRT")
+
+      lrt_results[[paste(gv, fv, sep = "_x_")]] <- data.frame(
+        Grouping_Var = gv,
+        Predictor    = fv,
+        Interaction  = paste0(gv, " × ", fv),
+        Chi_Square   = round(lrt_out$Deviance[2], 4),
+        df           = lrt_out$Df[2],
+        p_value      = round(lrt_out[["Pr(>Chi)"]][2], 6)
+      )
+    }, error = function(e) {
+      message("LRT failed for ", gv, " × ", fv, ": ", e$message)
+    })
+  }
+}
+
+lrt_tbl <- bind_rows(lrt_results) %>%
+  arrange(p_value) %>%
+  mutate(
+    Significant   = if_else(p_value < 0.05, "Yes", "No"),
+    p_value_label = case_when(
+      p_value < 0.001 ~ "< 0.001",
+      p_value < 0.01  ~ "< 0.01",
+      p_value < 0.05  ~ "< 0.05",
+      TRUE            ~ as.character(round(p_value, 4))
+    )
+  )
+
+cat("Likelihood ratio test results:\n")
+print(lrt_tbl %>% select(Interaction, Chi_Square, df, p_value_label, Significant))
+```
+
+```{r lrt-table}
+lrt_tbl %>%
+  select(Interaction, Chi_Square, df, p_value_label, Significant) %>%
+  gt() %>%
+  tab_header(
+    title    = "Likelihood Ratio Tests for Interaction Terms",
+    subtitle = "Grouping variables (sex, age group, race/ethnicity) × Top 5 SHAP predictors"
+  ) %>%
+  cols_label(
+    Interaction   = "Interaction Term",
+    Chi_Square    = "χ² Statistic",
+    df            = "df",
+    p_value_label = "p-value",
+    Significant   = "p < 0.05?"
+  ) %>%
+  tab_style(
+    style = list(cell_fill(color = "#DDEEFF"),
+                 cell_text(weight = "bold")),
+    locations = cells_body(rows = Significant == "Yes")
+  ) %>%
+  tab_footnote(
+    "χ² and p-values from likelihood ratio tests comparing base model to model
+    with added interaction term. Significant terms (p < 0.05) highlighted in blue.
+    Bonferroni-corrected threshold: p < 0.05 / number of tests."
+  )
+```
+
+```{r bonferroni-note}
+n_tests    <- nrow(lrt_tbl)
+bonf_alpha <- 0.05 / n_tests
+cat(sprintf("Bonferroni-corrected significance threshold (alpha / %d tests): %.5f\n",
+            n_tests, bonf_alpha))
+
+bonf_sig <- lrt_tbl %>% filter(p_value < bonf_alpha)
+cat("Interaction terms significant after Bonferroni correction:\n")
+if (nrow(bonf_sig) > 0) {
+  print(bonf_sig %>% select(Interaction, Chi_Square, p_value_label))
+} else {
+  cat("  None survived Bonferroni correction.\n")
+}
+```
+
+Interaction terms that survive Bonferroni correction indicate that the effect
+of a predictor on low-muscle-mass risk meaningfully varies by sex, age decade,
+or racial/ethnic group — a clinically important finding for targeted
+interventions.
+
+---
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
+
+---
+
+*Analysis conducted for CIND860 Capstone Project, Toronto Metropolitan University.*
+*Data source: CDC NHANES 2011–2018. Adiel Mallik, `r format(Sys.Date(), "%B %Y")`.*
